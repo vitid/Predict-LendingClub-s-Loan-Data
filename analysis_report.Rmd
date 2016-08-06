@@ -1,0 +1,1072 @@
+---
+title: "Predict LendingClub's Loan Data"
+output: html_document
+---
+
+# Synopsis
+In this report, we attempt to predict the risk of the loan being default based on the past loan data. The data is obtained from LendingClub's website(<https://www.lendingclub.com/info/download-data.action>). We use loan data from year 2012-2014 as traing and cross validation set and loan data from year 2015 as a test set. We also compare our investment performance against the baseline algorithm. We found that, among multiple machine learning algorithms that we tried, Logistic Regression provides reasonable trade-off performance, and higher return than naive loan picking strategy can be achieved
+
+```{r setup, include=FALSE}
+#cache the result
+knitr::opts_chunk$set(cache=TRUE)
+```
+
+# Explore Data
+
+The loan dataset can be downloaded from <https://www.lendingclub.com/info/download-data.action>. We renamed the file of 2012-2013 loan data to `loan_2012_2013.csv`, 2014 loan data to `loan_2014.csv` and 2015 loan data to `loan_2015.csv`. We stored them on the same directory of the script. The data dictionary can be found at the same url.  
+  
+There are 7 loan status: `Charged Off`,`Current`,`Default`,`Fully Paid`,`In Grace Period`,`Late (16-30 days)`,`Late (31-120 days)`. We consider `Late (31-120 days)`, `Default`, `Charged Off` as a default loan and `Fully Paid` as a desirable loan and ignore everything else. We can create shell script to filter such loan instead of loading the entire files.  
+  
+We create extract.sh to perform the task:  
+  
+    #!/bin/sh
+    
+    input_file=$1
+    output_file=$2
+    sed '2!d' $input_file > $output_file 
+    awk -F '","'  'BEGIN {OFS=","} { if (toupper($17) == "FULLY PAID" || toupper($17) == "LATE (31-120 DAYS)" || toupper($17) == "DEFAULT" || toupper($17) == "CHARGED OFF")  print }' $input_file >> $output_file 
+  
+Execute the following command in the command line to filter only target statuses:  
+  
+    sh extract.sh loan_2012_2013.csv loan_2012_2013.extract.csv
+    sh extract.sh loan_2014.csv loan_2014.extract.csv
+    sh extract.sh loan_2015.csv loan_2015.extract.csv
+  
+We can now use *.extract.csv as our dataset
+    
+```{r load_package,message=FALSE}
+#load all required package
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(corrplot)
+library(e1071)
+library(xgboost)
+library(stringr)
+library(lubridate)
+library(tm)
+library(rms)
+library(glmnet)
+library(pROC)
+library(doMC)
+library(kernlab)
+#make the analysis reproducible
+set.seed(100)
+
+setwd(".")
+```
+
+We firstly investigate overall data
+
+```{r load_data}
+data_a = read.csv("loan_2012_2013.extract.csv",stringsAsFactors=FALSE)
+data_b = read.csv("loan_2014.extract.csv",stringsAsFactors=FALSE)
+data = read.csv("loan_2015.extract.csv",stringsAsFactors=FALSE)
+data = rbind(data,data_a,data_b)
+rm(data_a,data_b)
+```
+
+We take a look at the number of each loan_status so far
+
+```{r}
+data %>% group_by(loan_status) %>% summarise(count = n())
+```
+
+We categorize `Charged Off`, `Default`, and `Late (31-120 days)` to a single category: `Default`. The data is moderately imbalance.
+
+```{r group_default_status}
+data$loan_status = ifelse(str_detect(data$loan_status,"Paid"),data$loan_status,"Default")
+
+tmp = data %>% group_by(loan_status) %>% summarise(ncount = n())
+tmp$ncount = 100 * tmp$ncount/nrow(data)
+tmp$ncount_p = str_c(round(tmp$ncount,2),"%")
+ggplot(tmp,aes(x=loan_status,y=ncount,fill=loan_status)) + geom_bar(stat="identity") +
+    geom_text(aes(label=ncount_p),vjust = 2)
+
+```
+
+# Problem Formulation
+
+The goal of this analysis is to produce a loan picking strategy that superior to the default one. Let's look at the return and default rate for each loan grade in both years.
+
+```{r}
+data$int_rate = (as.numeric(gsub(pattern = "%",replacement = "",x = data$int_rate)))
+#extract issued year
+data$issue_y = as.numeric(sapply( data$issue_d ,function(x){str_split(x,"-")[[1]][2]}))
+
+displayInterestByGrade <- function(dt){
+    g1 = dt %>% filter(loan_status == "Default") %>% group_by(grade) %>% summarise(default_count = n())
+    g2 = dt %>% group_by(grade) %>% summarise(count = n(),int_rate=mean(int_rate))
+    g2 %>% left_join(g1) %>% mutate(default_rate = 100*default_count/count) %>% select(grade,count,default_count,int_rate,default_rate)
+}
+
+#year 2012
+tmp0 = displayInterestByGrade(data %>% filter(issue_y==2012))
+tmp0$year = 2012
+#year 2013
+tmp1 = displayInterestByGrade(data %>% filter(issue_y==2013))
+tmp1$year = 2013
+#year 2014
+tmp2 = displayInterestByGrade(data %>% filter(issue_y==2014))
+tmp2$year = 2014
+#year 2015
+tmp3 = displayInterestByGrade(data %>% filter(issue_y==2015))
+tmp3$year = 2015
+tmp = rbind(tmp0,tmp1,tmp2,tmp3)
+
+ggplot(tmp, aes(x=grade, y=default_rate,fill=as.factor(year))) + geom_bar(stat="identity",position="dodge") + ggtitle("Default Rate(%)")
+
+ggplot(tmp, aes(x=grade, y=int_rate,fill=as.factor(year))) + geom_bar(stat="identity",position="dodge") + ggtitle("Interest Rate(%)")
+
+rm(tmp,tmp0,tmp1,tmp2,tmp3)
+```
+
+Loans with the same grade have similar interest rate and default rate across years, so we should be able to use dataset in previous years to predict the next.
+  
+The ROI of our baseline loan picking strategy-Picking Everythings-, for year 2015 is:
+
+```{r}
+all_roi = sum((data %>% filter(issue_y==2015))$total_pymnt)/sum((data %>% filter(issue_y==2015))$funded_amnt) - 1
+all_roi
+```
+
+or roughly -17.56%. Noted that we didn't include loan in `Current` status(which can end up as being `Fully Paid` or `Charged Off`(default)), so negative ROI is as expected. Again, the higher this number is, the better.
+  
+We can look at ROI pertaining to each loan grade
+
+```{r construct_baseline_table}
+data$prediction = "Fully Paid"
+createPerformanceTable <- function(dt){
+    
+    dt_pick = dt %>% filter(prediction == "Fully Paid")
+    all_roi = sum(dt_pick$total_pymnt)/sum(dt_pick$funded_amnt) - 1
+
+    temp_table = data.frame(grade=character(0),roi=numeric(0),percent_pick=numeric(0))
+    for(g in c("A","B","C","D","E","F","G")){
+        data_pick_grade = dt_pick %>% filter(grade==g)
+        if(nrow(data_pick_grade)==0){
+            temp_table = rbind(temp_table,data.frame(grade=g,roi=0,percent_pick=0))
+        }
+        else
+        {
+            data_grade = dt %>% filter(grade==g)
+            roi = sum(data_pick_grade$total_pymnt)/sum(data_pick_grade$funded_amnt) - 1
+            temp_table = rbind(temp_table,data.frame(grade=g,roi=roi,percent_pick=100 * nrow(data_pick_grade)/nrow(data_grade)))
+        }
+    }
+    
+    temp_table = rbind(temp_table,data.frame(grade="ALL",roi=all_roi,percent_pick=100 * nrow(dt_pick)/nrow(dt) ))
+    
+    return(temp_table)
+}
+
+baseline_table = createPerformanceTable(data %>% filter(issue_y==2015))
+baseline_table
+```
+
+The `baseline_table` will served as a baseline performance when we evaluate our model.
+
+# Model Building Strategy
+
+2012-2014 data will served as training & cross validation set and 2015 as a test set. We will put more emphasis on avoiding **default** loans since they can wreak havoc on our overall investment. We also take a note of percentage of loan picked as picking a small number of loans doesn't make a sizable investment.
+
+# Feature Engineering
+
+We will explore some features in the dataset. We investigate 2012-2014 data and later apply to 2015 data.
+
+```{r discard_2015_data}
+data1 = data %>% filter(issue_y != 2015)
+#look at number of row and column
+dim(data1)
+
+rm(data)
+```
+
+Looking at the data dictionary, we can identify and drop irrelevant features(features that do not appear at the issued time, or id field). `emp_title` maybe useful but it need to be effectively categorized.
+
+```{r drop_irrelevant_features}
+discard_column = c("collection_recovery_fee","emp_title",
+                   "funded_amnt_inv","id",
+                   "installment","last_credit_pull_d",
+                   "last_fico_range_high","last_fico_range_low",
+                   "last_pymnt_amnt","last_pymnt_d",
+                   "loan_amnt","member_id",
+                   "next_pymnt_d","num_tl_120dpd_2m",
+                   "num_tl_30dpd","out_prncp",
+                   "out_prncp_inv","recoveries",
+                   "total_pymnt","total_pymnt_inv",
+                   "total_rec_int","total_rec_late_fee",
+                   "total_rec_prncp","url",
+                   "zip_code"
+                   )
+
+data1 = (data1[,!(names(data1) %in% discard_column)])
+```
+
+We also drop `grade` featrue as such data also carried in `sub_grade`
+```{r drop_grade}
+data1$grade = NULL
+```
+
+We drop features that contain too many NA values. We can list the raito of `NA` value for each feature:
+
+```{r show_na_raito}
+tmp = sort(sapply(data1, function(x) sum(length(which(is.na(x)))))/nrow(data1),decreasing = TRUE)
+```
+
+Drop features that have more than 50% missing and take a look at what features that are still missing:
+
+```{r drop_too_many_na}
+discard_column = names(tmp[tmp>0.5])
+data1 = (data1[,!(names(data1) %in% discard_column)])
+
+tmp = sort(sapply(data1, function(x) sum(length(which(is.na(x)))))/nrow(data1),decreasing = TRUE)
+tmp[tmp>0]
+```
+
+```{r missing_distribution}
+tmp = tmp[tmp>0]
+
+par(mfrow=c(2,3))
+for(feature_name in names(tmp)){
+    hist(data1[[feature_name]],main = str_c(feature_name,"(missing=",100* round(as.numeric(tmp[feature_name]),2) ,"%)") )
+}
+```
+
+```{r message=FALSE}
+par(mfrow=c(1,1))
+```
+
+From the look of distributions, it is reasonable to impute missing values with the median value. We store `median_impute_model` for further use.
+
+```{r impute_median_to_na}
+median_impute_model = preProcess(data1[names(tmp)],method="medianImpute")
+data1 = predict(median_impute_model,data1)
+```
+
+Let's re-check the columns left, there should be no feature with NA value
+
+```{r}
+sort(sapply(data1, function(x) sum(length(which(is.na(x)))))/nrow(data1),decreasing = TRUE)
+```
+
+Let's take a look at all features left
+
+```{r}
+str(data1)
+```
+
+We parse revol_util to numeric
+
+```{r parse revol_util to numeric}
+data1$revol_util = (as.numeric(gsub(pattern = "%",replacement = "",x = data1$int_rate)))
+```
+
+`earliest_cr_line` is transformed to the number of days before the loan is issued
+
+```{r transform_earliest_cr_line}
+data1$earliest_cr_line = parse_date_time(str_c("01",data1$issue_d),"dmy" ) - parse_date_time(str_c("01",data1$earliest_cr_line),"dmy" )
+data1$earliest_cr_line = as.numeric(data1$earliest_cr_line,units = "days")
+```
+
+We can see that the default rate doesn't vary much by the month it issued. We will drop `issue_d`
+
+```{r drop_issue_m}
+#extract issued month
+data1$issue_m = sapply( data1$issue_d ,function(x){str_split(x,"-")[[1]][1]})
+
+tmp = data1 %>% filter(loan_status=="Default") %>% group_by(issue_m) %>% summarise(default_count = n())
+tmp2 = data1 %>% group_by(issue_m) %>% summarise(count = n())
+tmp2 %>% left_join(tmp) %>% mutate(default_rate = default_count/count)
+
+data1$issue_m = NULL
+data1$issue_d = NULL
+
+rm(tmp,tmp2)
+```
+
+Let's see if there are any features that have zero variance:
+
+```{r}
+#define some functions to be used later on
+getNumericColumns<-function(t){
+    tn = sapply(t,function(x){is.numeric(x)})
+    return(names(tn)[which(tn)])
+}
+
+getCharColumns<-function(t){
+    tn = sapply(t,function(x){is.character(x)})
+    return(names(tn)[which(tn)])
+}
+
+getFactorColumns<-function(t){
+    tn = sapply(t,function(x){is.factor(x)})
+    return(names(tn)[which(tn)])
+}
+
+getIndexsOfColumns <- function(t,column_names){
+    return(match(column_names,colnames(t)))
+}
+```
+
+```{r}
+tmp = apply(data1[getCharColumns(data1)],2,function(x){length(unique(x))})
+tmp = tmp[tmp==1]
+
+tmp2 = apply(data1[getNumericColumns(data1)],2,function(x){(sd(x))})
+tmp2 = tmp2[tmp2==0]
+
+discard_column = c(names(tmp),names(tmp2))
+discard_column
+```
+
+We then proceed to drop the zero variance features
+
+```{r drop_zero_variance}
+data1 = (data1[,!(names(data1) %in% discard_column)])
+```
+
+Next, we investigate whether `desc`(description) can be useful in determining Default and Fully Paid loand. However, noted that our test dataset(2015 loans) has only **9** loans with non-empty description's length so `desc` is quite useless for current 2015 data. Also noted that information in `title` is replicated in `purpose` so we will drop them.
+
+```{r drop_desc_title}
+data1$desc = NULL
+data1$title = NULL
+```
+
+We take a look at default rate for each state
+
+```{r}
+tmp = data1 %>% filter(loan_status=="Default") %>% group_by(addr_state,issue_y) %>% summarise(default_count = n())
+tmp2 = data1 %>% group_by(addr_state,issue_y) %>% summarise(count = n())
+tmp3 = tmp2 %>% left_join(tmp) %>% mutate(default_rate = default_count/count)
+
+#order by highest default rate
+a0 = (tmp3 %>% filter(issue_y == 2012 & count > 1000) %>% arrange(desc(default_rate)))[1:10,"addr_state"]$addr_state
+a1 = (tmp3 %>% filter(issue_y == 2013 & count > 1000) %>% arrange(desc(default_rate)))[1:10,"addr_state"]$addr_state
+a2 = (tmp3 %>% filter(issue_y == 2014 & count > 1000) %>% arrange(desc(default_rate)))[1:10,"addr_state"]$addr_state
+high_default = intersect(intersect(a0,a1),a2)
+
+#order by lowest default rate
+a0 = (tmp3 %>% filter(issue_y == 2012 & count > 1000) %>% arrange((default_rate)))[1:10,"addr_state"]$addr_state
+a1 = (tmp3 %>% filter(issue_y == 2013 & count > 1000) %>% arrange((default_rate)))[1:10,"addr_state"]$addr_state
+a2 = (tmp3 %>% filter(issue_y == 2014 & count > 1000) %>% arrange((default_rate)))[1:10,"addr_state"]$addr_state
+low_default = intersect(intersect(a0,a1),a2)
+```
+
+We noticed Florida and New York consistently constitute in top 10 - highest default rate
+
+```{r}
+high_default
+```
+
+While Illinois, Texas, California, Georgia have lowest default rate
+
+```{r}
+low_default
+```
+
+We then create binary variable for 6 states and discard the rest
+
+```{r dummy_var_states}
+data1$is_fl = ifelse(data1$addr_state=="FL",1,0)
+data1$is_ny = ifelse(data1$addr_state=="NY",1,0)
+
+data1$is_il = ifelse(data1$addr_state=="IL",1,0)
+data1$is_tx = ifelse(data1$addr_state=="TX",1,0)
+data1$is_ca = ifelse(data1$addr_state=="CA",1,0)
+data1$is_ga = ifelse(data1$addr_state=="GA",1,0)
+
+data1$addr_state = NULL
+
+rm(tmp,tmp2,tmp3,a0,a1,a2,high_default,low_default)
+```
+
+We will investigate if there are any correlation among features
+
+```{r}
+corrplot(cor(data1[getNumericColumns(data1)],use="na.or.complete"))
+```
+
+We found some features are quite correlated, we can remove correlated features with `findCorrelation` function. The function will find all correlated pairs that have correlation exceed a specified threshold and try to remove one of them in such a way that overall correlation is reduced.
+
+```{r}
+high_corr <- findCorrelation(cor(data1[getNumericColumns(data1)]), cutoff = .75)
+high_corr = getNumericColumns(data1)[high_corr]
+high_corr
+```
+
+```{r drop_corr_features}
+data1 = (data1[,!(names(data1) %in% high_corr)])
+```
+
+Let's look at all numeric features we have left.
+
+```{r}
+str(data1[getNumericColumns(data1)])
+```
+
+We transform `annual_inc`, `revol_bal`, `avg_cur_bal`, `bc_open_to_buy`, `total_il_high_credit_limit` by deviding them by `funded_amnt`(amount of loan)
+
+```{r divide_by_funded_amnt}
+data1$annual_inc = data1$annual_inc/data1$funded_amnt
+data1$revol_bal = data1$revol_bal/data1$funded_amnt
+data1$avg_cur_bal = data1$avg_cur_bal/data1$funded_amnt
+data1$bc_open_to_buy = data1$bc_open_to_buy/data1$funded_amnt
+data1$total_il_high_credit_limit = data1$total_il_high_credit_limit/data1$funded_amnt
+
+data1$funded_amnt = NULL
+```
+
+Let's look at all character features we have left.
+
+```{r}
+str(data1[getCharColumns(data1)])
+```
+
+We look at `home_ownership` and filter only observations that have value "MORTGAGE","OWN", or "RENT" as these are only values that appear in 2015 data
+
+```{r modify_home_ownership}
+table(data1$home_ownership)
+
+data1 = data1 %>% filter(home_ownership == "MORTGAGE" | home_ownership == "OWN" | home_ownership == "RENT")
+```
+
+We see there are 3 loans with pymnt_plan="y", all ended in being default
+
+```{r}
+data1 %>% filter(pymnt_plan=="y") %>% select(loan_status)
+```
+
+But 3 loans is too small to make the conclusive finding. We will just remove `pymnt_plan` feature. 
+
+```{r remove_pymnt_plan}
+data1$pymnt_plan = NULL
+```
+
+remove issue_y as it has no further used
+
+```{r echo=FALSE}
+#remove remaining variables
+data1$issue_y = NULL
+
+rm(all_roi,c,discard_column,feature_name,high_corr,numeric_column)
+```
+
+We will transform all character predictor features to binary features
+
+```{r char_col_to_dummy_var}
+loan_status = data1$loan_status
+dummy_model = dummyVars(loan_status ~ .,data1,fullRank = TRUE)
+data1 = as.data.frame(predict(dummy_model,data1))
+data1$loan_status = loan_status
+rm(loan_status)
+
+#set loan with status 'Fully Paid' as a positive sample
+data1$loan_status = ifelse(data1$loan_status == "Fully Paid","Fully.Paid",data1$loan_status)
+data1$loan_status = factor(data1$loan_status,levels = c("Default","Fully.Paid"))
+```
+
+The data is centered and scaled. We then fit the train data to Logistic regression and investigate p-value of coefficients.
+
+```{r center_scale_data}
+trans_model = preProcess(data1,method=c("center","scale"))
+data1 = predict(trans_model, data1)
+
+model = lrm(loan_status ~ .,data1)
+model
+```
+
+We set our two-tailed p-value cutoff at 0.01, we discard features with p-value exceed this threshold.
+
+```{r}
+tmp = as.data.frame(anova(model))
+tmp$feature = rownames(tmp)
+tmp = tmp %>% filter(P > 0.01) %>% select(feature,P)
+tmp
+```
+
+```{r remove_p_value_exceed_threshold}
+data1 = (data1[,!(names(data1) %in% tmp$feature)])
+
+rm(model,tmp)
+```
+
+Some feature names are invalid, replace invalid characters with "_"
+```{r rename_feature_name}
+colnames(data1) = str_replace_all(colnames(data1)," ","_")
+colnames(data1) = str_replace_all(colnames(data1),"<","_")
+colnames(data1) = str_replace_all(colnames(data1),"/","_")
+```
+
+We then create function to apply all of the above feature engineering:
+
+```{r feature_engineering_function}
+#derived from str_c("'",paste(colnames(data1),collapse="','"),"'")
+#kept_column = colnames(data1)
+kept_column = c('term_60_months','sub_gradeA2','sub_gradeA3','sub_gradeA4','sub_gradeA5','sub_gradeB1','sub_gradeB2','sub_gradeB3','sub_gradeB4','sub_gradeB5','sub_gradeC1','sub_gradeC2','sub_gradeC3','sub_gradeC4','sub_gradeC5','sub_gradeD1','sub_gradeD2','sub_gradeD3','sub_gradeD4','sub_gradeD5','sub_gradeE1','sub_gradeE2','sub_gradeE3','sub_gradeE4','sub_gradeE5','sub_gradeF1','sub_gradeF2','sub_gradeF3','sub_gradeF4','sub_gradeF5','sub_gradeG1','sub_gradeG2','sub_gradeG3','sub_gradeG4','sub_gradeG5','emp_length__1_year','emp_length9_years','emp_lengthn_a','home_ownershipOWN','home_ownershipRENT','annual_inc','verification_statusSource_Verified','purposemedical','purposemoving','purposeother','purposesmall_business','purposewedding','dti','delinq_2yrs','inq_last_6mths','revol_util','total_acc','acc_open_past_24mths','avg_cur_bal','bc_open_to_buy','mo_sin_old_il_acct','mo_sin_old_rev_tl_op','mo_sin_rcnt_tl','mort_acc','mths_since_recent_bc','num_accts_ever_120_pd','num_actv_bc_tl','num_bc_tl','num_tl_90g_dpd_24m','pct_tl_nvr_dlq','percent_bc_gt_75','pub_rec_bankruptcies','total_il_high_credit_limit','is_fl','is_ny','is_tx','is_ca','is_ga','loan_status')
+
+applyFeatureEngineering <- function(dt,use_kept_column = kept_column,use_median_impute_model=median_impute_model,  use_dummy_model=dummy_model,use_trans_model=trans_model){
+    
+    #consolidate loan status
+    dt$loan_status = ifelse(str_detect(dt$loan_status,"Paid"),dt$loan_status,"Default")
+    #parse int_rate
+    dt$int_rate = (as.numeric(gsub(pattern = "%",replacement = "",x = dt$int_rate)))
+    #impute median
+    dt = predict(median_impute_model,dt)
+    #parse revol_util
+    dt$revol_util = (as.numeric(gsub(pattern = "%",replacement = "",x = dt$int_rate)))
+    #binary variables for addr_state
+    dt$is_fl = ifelse(dt$addr_state=="FL",1,0)
+    dt$is_ny = ifelse(dt$addr_state=="NY",1,0)
+    
+    dt$is_il = ifelse(dt$addr_state=="IL",1,0)
+    dt$is_tx = ifelse(dt$addr_state=="TX",1,0)
+    dt$is_ca = ifelse(dt$addr_state=="CA",1,0)
+    dt$is_ga = ifelse(dt$addr_state=="GA",1,0)
+    #transform transactions
+    dt$annual_inc = dt$annual_inc/dt$funded_amnt
+    dt$revol_bal = dt$revol_bal/dt$funded_amnt
+    dt$avg_cur_bal = dt$avg_cur_bal/dt$funded_amnt
+    dt$bc_open_to_buy = dt$bc_open_to_buy/dt$funded_amnt
+    dt$total_il_high_credit_limit = dt$total_il_high_credit_limit/dt$funded_amnt
+    #if purpose falling outside of recognized values
+    all_purpose = c('debt_consolidation','small_business','other','credit_card','major_purchase','moving','home_improvement','house','car','medical','renewable_energy','vacation','wedding')
+    dt$purpose = ifelse(dt$purpose %in% all_purpose,dt$purpose,"other")
+    #create dummy variables
+    loan_status = dt$loan_status
+    dt = as.data.frame(predict(use_dummy_model,dt))
+    dt$loan_status = loan_status
+    #center,scale data
+    dt = predict(use_trans_model, dt)
+    #remove all unused features
+    colnames(dt) = str_replace_all(colnames(dt)," ","_")
+    colnames(dt) = str_replace_all(colnames(dt),"<","_")
+    colnames(dt) = str_replace_all(colnames(dt),"/","_")
+    dt = dt[use_kept_column]
+    
+    #set loan with status 'Fully Paid' as a positive sample
+    dt$loan_status = ifelse(dt$loan_status == "Fully Paid","Fully.Paid",dt$loan_status)
+    dt$loan_status = factor(dt$loan_status,levels = c("Default","Fully.Paid"))
+    
+    return(dt)
+}
+
+```
+
+## Fitting Data
+
+We need to determine which performance metric we want to focus on. We load the 2015 test dataset and apply feature engineering procedure.
+
+```{r load_test_data}
+test_data = read.csv("loan_2015.extract.csv",stringsAsFactors=FALSE)
+#later used for evaluate investment
+test_data_grade = test_data$grade
+test_data_funded_amnt = test_data$funded_amnt
+test_data_total_pymnt = test_data$total_pymnt
+
+test_data = applyFeatureEngineering(test_data)
+```
+
+The loan data is typically have higher proportion of good loans. We can achieve high accuracy just by labelling all loans as `Fully Paid`
+
+```{r}
+100*nrow(test_data %>% filter(loan_status=="Fully.Paid"))/nrow(test_data)
+```
+
+For our test data, we gain 72.3% accuracy by just following the above strategy. Recall that we yet to include the outcome of `Current` loans. In a real situation, the raito of `Fully Paid` loans is usually much higher so accuracy metric is not our main concern here. Since the cost of accepting a good loan is highly outweighted by a bad one, we instead focus on a trade-off in identifying a default loan as the expense of mislabelling some good loans. We will look at ROC curve and pay particular focus on AUC when we train our models.  
+
+Because there is a disproportion of target variable, we downsampling the Fully Paid loans to be equal to Default loans. This method tends to work well in practice and run faster than upsampling or cost-sensitive training.  
+
+Noted that at the end, we aim to stack the results of various learning models(Logistic Regression,SVM,RandomForest, and XGB). Since the downside of downsampling is that information of majority class is discarded, we will continue to make a new downsampling data when we feed it to each model along the way. We anticipate that better result can be obtained by stacking all 4 models since it get more information from the majority class.
+
+# Logistic Regression
+
+We tune Logistic Regression to our training dataset. We use Elastic Net regularization, which comprised of Ridge and Lasso regularization, with cross validation to prevent overfitting. Our goal is maximizing AUC.  
+  
+Due to limited computation resource, we run model tunning on small data and fixed lambda parameter. We use small fold: 3-fold cross validation. We then refit the best model with the whole data.  
+(Noted:we put the final tuning result here instead of running through the whole  process. We disable the execution of tuning code although readers can enable it back by setting `eval` = TRUE )
+
+```{r construct_train_index}
+set.seed(100)
+samp = downSample(data1[-getIndexsOfColumns(data1, c( "loan_status") )],data1$loan_status,yname="loan_status")
+#choose small data for tuning 
+train_index = createDataPartition(samp$loan_status,p = 0.05,list=FALSE,times=1)
+```
+
+```{r logistic_retression_tunning,eval=FALSE}
+#run tuning in parallel using available computing cores(you may need to change this)
+registerDoMC(cores = 4)
+
+ctrl <- trainControl(method = "cv",
+    summaryFunction = twoClassSummary,
+    classProbs = TRUE,
+    number = 3
+    )
+
+glmnGrid = expand.grid(.alpha = seq(0, 1, length = 10), .lambda = 0.01)
+
+glmnTuned = train(samp[train_index,-getIndexsOfColumns(samp,"loan_status")],y = samp[train_index,"loan_status"],method = "glmnet",tuneGrid = glmnGrid,metric = "ROC",trControl = ctrl)
+```
+
+```{r,eval=FALSE}
+plot(glmnTuned)
+glmnTuned
+```
+
+The best penalty parameter is alpha = 0.7777778(more weight on Ridge) with fixed shrinking lambda = 0.01. We use this parameter to retrain the whole sample.
+
+```{r}
+model = glmnet(
+    x = as.matrix(samp[-getIndexsOfColumns(samp,"loan_status")]),
+    y=samp$loan_status,
+    alpha = 0.7777778,
+    lambda = 0.01,
+    family = "binomial",
+    standardize = FALSE)
+```
+
+The finalized Logistic Regression model is applied to the 2015 loan data. We look at ROC graph and AUC. We also set probability prediction cutoff at 50%(noted that the higher this value is, the more likely the loan is `Fully Paid`) and collect some performance metrics for a later comparison.
+
+```{r}
+#data frame for collect model's performance
+table_perf = data.frame(model=character(0),
+                        auc=numeric(0),
+                        accuracy=numeric(0),
+                        sensitivity=numeric(0),
+                        specificity=numeric(0),
+                        kappa=numeric(0),
+                        stringsAsFactors = FALSE
+                        )
+
+predict_loan_status_logit = predict(model,newx = as.matrix(test_data[-getIndexsOfColumns(test_data,"loan_status")]),type="response")
+
+rocCurve_logit = roc(response = test_data$loan_status,
+               predictor = predict_loan_status_logit)
+
+auc_curve = auc(rocCurve_logit)
+
+plot(rocCurve_logit,legacy.axes = TRUE,print.auc = TRUE,col="red",main="ROC(Logistic Regression)")
+```
+
+```{r}
+#make a prediction on 50% cutoff
+predict_loan_status_label = ifelse(predict_loan_status_logit<0.5,"Default","Fully.Paid")
+c = confusionMatrix(predict_loan_status_label,test_data$loan_status,positive="Fully.Paid")
+
+table_perf[1,] = c("logistic regression",
+  round(auc_curve,3),
+  as.numeric(round(c$overall["Accuracy"],3)),
+  as.numeric(round(c$byClass["Sensitivity"],3)),
+  as.numeric(round(c$byClass["Specificity"],3)),
+  as.numeric(round(c$overall["Kappa"],3))
+  )
+rm(samp,train_index)
+```
+
+The model's performance is as follow
+
+```{r}
+tail(table_perf,1)
+```
+
+# SVM
+
+For SVM, we use Radial Basis as a kernel function. Due to limited computation reason, we use 5% of downsampling data for tunning parameter and 10% of downsampling data for training. 
+
+```{r}
+set.seed(200)
+#down sampling again so than we get more info when stacking
+samp = downSample(data1[-getIndexsOfColumns(data1, c( "loan_status") )],data1$loan_status,yname="loan_status")
+#choose small data for tuning 
+train_index_tuning = createDataPartition(samp$loan_status,p = 0.05,list=FALSE,times=1)
+#choose small data for re-train
+train_index_training = createDataPartition(samp$loan_status,p = 0.1,list=FALSE,times=1)
+```
+
+```{r,eval=FALSE}
+svmGrid = expand.grid(
+                .sigma = as.numeric(sigest(loan_status ~.,data = samp[train_index_tuning,],scaled=FALSE)),
+                .C = c(0.1,1,10)
+                )
+
+svmTuned = train(
+    samp[train_index_tuning,-getIndexsOfColumns(samp,"loan_status")],
+    y = samp[train_index_tuning,"loan_status"],
+    method = "svmRadial",
+    tuneGrid = svmGrid,
+    metric = "ROC",
+    trControl = ctrl,
+    preProcess = NULL,
+    scaled = FALSE,
+    fit = FALSE)
+
+plot(svmTuned)
+
+svmTuned
+```
+
+The best parameter for the model is `sigma` = 0.003909534, and `C` = 0.1. We use this values to fit the 10% of downsampling data and collect its performance based on test set.
+
+```{r}
+svm_model = ksvm(loan_status ~ .,
+                 data = samp[train_index_training,],
+                 kernel = "rbfdot",
+                 kpar = list(sigma=0.003909534),
+                 C = 0.1,
+                 prob.model = TRUE,
+                 scaled = FALSE)
+
+predict_loan_status_svm = predict(svm_model,test_data,type="probabilities")
+predict_loan_status_svm = as.data.frame(predict_loan_status_svm)$Fully.Paid
+
+rocCurve_svm = roc(response = test_data$loan_status,
+               predictor = predict_loan_status_svm)
+
+auc_curve = auc(rocCurve_svm)
+
+plot(rocCurve_svm,legacy.axes = TRUE,print.auc = TRUE,col="red",main="ROC(SVM)")
+
+predict_loan_status_label = ifelse(predict_loan_status_svm<0.5,"Default","Fully.Paid")
+c = confusionMatrix(predict_loan_status_label,test_data$loan_status,positive="Fully.Paid")
+```
+
+This is the summary of model's performance
+```{r}
+table_perf[2,] = c("SVM",
+  round(auc_curve,3),
+  as.numeric(round(c$overall["Accuracy"],3)),
+  as.numeric(round(c$byClass["Sensitivity"],3)),
+  as.numeric(round(c$byClass["Specificity"],3)),
+  as.numeric(round(c$overall["Kappa"],3))
+  )
+
+tail(table_perf,1)
+```
+
+# RandomForest
+
+Now, we tune RandomForest model. Like SVM, we tune parameter based on 5% downsampling data.
+
+```{r}
+set.seed(300)
+#down sampling again so than we get more info when stacking
+samp = downSample(data1[-getIndexsOfColumns(data1, c( "loan_status") )],data1$loan_status,yname="loan_status")
+#choose small data for tuning 
+train_index_tuning = createDataPartition(samp$loan_status,p = 0.05,list=FALSE,times=1)
+#choose small data for re-train
+train_index_training = createDataPartition(samp$loan_status,p = 0.1,list=FALSE,times=1)
+```
+
+```{r eval=FALSE}
+rfGrid = expand.grid(
+                .mtry = as.integer(seq(2,ncol(samp), (ncol(samp) - 2)/4))
+                )
+
+rfTuned = train(
+    samp[train_index_tuning,-getIndexsOfColumns(samp,"loan_status")],
+    y = samp[train_index_tuning,"loan_status"],
+    method = "rf",
+    tuneGrid = rfGrid,
+    metric = "ROC",
+    trControl = ctrl,
+    preProcess = NULL,
+    ntree = 100
+    )
+
+plot(rfTuned)
+
+rfTuned
+```
+
+The best parameter is `mtry`(number of predictors) = 2. Like SVM, we fit 10% of downsampling data with this value.
+
+```{r}
+rf_model = randomForest(loan_status ~ . ,data = samp[train_index_training,],mtry = 2,ntree=400)
+
+predict_loan_status_rf = predict(rf_model,test_data,"prob")
+predict_loan_status_rf = as.data.frame(predict_loan_status_rf)$Fully.Paid
+
+rocCurve_rf = roc(response = test_data$loan_status,
+               predictor = predict_loan_status_rf)
+
+auc_curve = auc(rocCurve_rf)
+
+plot(rocCurve_rf,legacy.axes = TRUE,print.auc = TRUE,col="red",main="ROC(RandomForest)")
+
+predict_loan_status_label = ifelse(predict_loan_status_rf<0.5,"Default","Fully.Paid")
+c = confusionMatrix(predict_loan_status_label,test_data$loan_status,positive="Fully.Paid")
+
+table_perf[3,] = c("RandomForest",
+  round(auc_curve,3),
+  as.numeric(round(c$overall["Accuracy"],3)),
+  as.numeric(round(c$byClass["Sensitivity"],3)),
+  as.numeric(round(c$byClass["Specificity"],3)),
+  as.numeric(round(c$overall["Kappa"],3))
+  )
+```
+
+The model's performance is as follow
+```{r}
+tail(table_perf,1)
+```
+
+# Extreme Gradient Boosting
+
+Extreme Gradient Boosting has a very effecient implementation. Unlike SVM and RandomForest, we can tune parameter using the whole downsampling set. We focus on varying Reidge & Lasso regularization and learning rate. We use 10% of data for validating tuning parameter.
+
+```{r}
+set.seed(400)
+#down sampling again so than we get more info when stacking
+samp = downSample(data1[-getIndexsOfColumns(data1, c( "loan_status") )],data1$loan_status,yname="loan_status")
+#choose small data for validating
+train_index_tuning= createDataPartition(samp$loan_status,p = 0.1,list=FALSE,times=1)
+```
+
+```{r eval=FALSE}
+etas = c(0.1,0.3)
+alphas = c(0,0.5,1)
+lambdas = c(0,0.5,1)
+
+test_watchlist = list(
+    test = xgb.DMatrix(
+        data = as.matrix(samp[train_index_tuning,][getNumericColumns(samp)]),
+        label = as.numeric(samp[train_index_tuning,"loan_status"])-1
+    )
+)
+
+gbm_perf = data.frame(eta=numeric(0),alpha=numeric(0),lambda=numeric(0),auc=numeric(0))
+for(eta in etas){
+    for(alpha in alphas){
+        for(lambda in lambdas){
+            model = xgb.train(
+                data= xgb.DMatrix(
+                    data = as.matrix(samp[-train_index_tuning,][getNumericColumns(samp)]),
+                    label = as.numeric(samp[-train_index_tuning,"loan_status"])-1
+                ),
+                objective = "binary:logistic",
+                nrounds = 350,
+                watchlist = test_watchlist,
+                eval_metric = "auc",
+                early.stop.round = 10,
+                alpha = alpha,
+                lambda = lambda,
+                eta = eta)
+            gbm_perf[nrow(gbm_perf)+1,] = c(eta,alpha,lambda,model$bestScore)
+        }
+    }
+}
+
+gbm_perf %>% arrange(desc(auc))
+```
+
+The best tuning parameter is `eta` = 0.1, `alpha` = 0.5, and `lambda` = 1.0. We retrain it again here in case readers didn't run the tuning code. We collect its performance.
+
+```{r}
+set.seed(400)
+test_watchlist = list(
+    test = xgb.DMatrix(
+        data = as.matrix(samp[train_index_tuning,][getNumericColumns(samp)]),
+        label = as.numeric(samp[train_index_tuning,"loan_status"])-1
+    )
+)
+
+xgb_model = xgb.train(
+                data= xgb.DMatrix(
+                    data = as.matrix(samp[-train_index_tuning,][getNumericColumns(samp)]),
+                    label = as.numeric(samp[-train_index_tuning,"loan_status"])-1
+                ),
+                objective = "binary:logistic",
+                nrounds = 350,
+                watchlist = test_watchlist,
+                eval_metric = "auc",
+                early.stop.round = 10,
+                alpha = 0.5,
+                lambda = 1.0,
+                eta = 0.1)
+
+predict_loan_status_xgb = predict(xgb_model,as.matrix(test_data[getNumericColumns(test_data)]))
+
+rocCurve_xgb = roc(response = test_data$loan_status,
+               predictor = predict_loan_status_xgb)
+
+auc_curve = auc(rocCurve_xgb)
+
+plot(rocCurve_xgb,legacy.axes = TRUE,print.auc = TRUE,col="red",main="ROC(XGB)")
+
+predict_loan_status_label = ifelse(predict_loan_status_xgb<0.5,"Default","Fully.Paid")
+c = confusionMatrix(predict_loan_status_label,test_data$loan_status,positive="Fully.Paid")
+
+table_perf[4,] = c("XGB",
+  round(auc_curve,3),
+  as.numeric(round(c$overall["Accuracy"],3)),
+  as.numeric(round(c$byClass["Sensitivity"],3)),
+  as.numeric(round(c$byClass["Specificity"],3)),
+  as.numeric(round(c$overall["Kappa"],3))
+  )
+```
+
+The model's performance is as follow
+
+```{r}
+tail(table_perf,1)
+```
+
+# Averaging Ensemble
+
+Our final model is to combine the result of previous machine learning models and provide a single prediction by averaging probabilities from all previous models.
+
+```{r}
+predict_loan_status_ensemble = predict_loan_status_logit +
+                               predict_loan_status_svm +
+                               predict_loan_status_rf +
+                               predict_loan_status_xgb
+
+predict_loan_status_ensemble = predict_loan_status_ensemble / 4
+
+rocCurve_ensemble = roc(response = test_data$loan_status,
+               predictor = predict_loan_status_ensemble)
+
+auc_curve = auc(rocCurve_ensemble)
+
+plot(rocCurve_ensemble,legacy.axes = TRUE,print.auc = TRUE,col="red",main="ROC(Ensemble Avg.)")
+
+predict_loan_status_label = ifelse(predict_loan_status_ensemble<0.5,"Default","Fully.Paid")
+c = confusionMatrix(predict_loan_status_label,test_data$loan_status,positive="Fully.Paid")
+
+table_perf[5,] = c("Ensemble",
+  round(auc_curve,3),
+  as.numeric(round(c$overall["Accuracy"],3)),
+  as.numeric(round(c$byClass["Sensitivity"],3)),
+  as.numeric(round(c$byClass["Specificity"],3)),
+  as.numeric(round(c$overall["Kappa"],3))
+  )
+```
+
+We get the following performance
+
+```{r}
+tail(table_perf,1)
+```
+
+# Model Comparison
+
+AUC for each model and their performance when we set probability cutoff at 50% is summarised below
+
+```{r}
+table_perf
+```
+
+```{r}
+plot(rocCurve_logit,legacy.axes = TRUE,col="red",main="ROC compare")
+plot(rocCurve_svm,legacy.axes = TRUE,col="blue",add=TRUE)
+plot(rocCurve_rf,legacy.axes = TRUE,col="green",add=TRUE)
+plot(rocCurve_xgb,legacy.axes = TRUE,col="orange",add=TRUE)
+plot(rocCurve_ensemble,legacy.axes = TRUE,col="black",add=TRUE)
+
+legend("bottomright",legend=c("logit","svm","rf","xbg","ensemble"),fill=c("red","blue","green","orange","black"))
+```
+
+Kappa statistics from all models exceed 20%, which indicate that they perform moderately better than chance. XGB takes advantage of receiving all downsampling data and provides highest AUC. Comparing performance across models may not be valid, though, because we use different downsampling data for each model. Ensemble model doesn't imporove AUC as we expected.
+
+We are surprised to find that Logistic regression does provide very good performance. At 50% cutoff, it yields reasonable compromise between percentage of correctly identified good loans(Sensitivity) and bad loans(Specificity) while not sacrificing Accuracy too much(recall that the naive strategy yields 72.3% accuracy). SVM with RBF kernel has lowest AUC. We can train it with only some portion of data as time complexity of the model rapidly jump up. RandomForest yields comparabale result to Logistic Regression. XGB sacrifices Sensitivity rate for Specificity(ability to recall bad loans). It maybe suitable if we really want to avoid default loans. Ensemble model does tune up XGB a little bit. Given the simplicity of Logistic Regression model, and ROC graph are, over all, not significantly difference, we recommend it as a model of choice for predicting LendingClub dataset.
+
+We can calculate investment performance assumed that we follow each model predictions based on 50% cutoff:
+
+```{r}
+#assign the features back for evaluation
+test_data$grade = test_data_grade
+test_data$funded_amnt = test_data_funded_amnt
+test_data$total_pymnt = test_data_total_pymnt
+
+#logistic regression
+test_data$prediction =  ifelse(predict_loan_status_logit<0.5,"Default","Fully Paid")
+logit_table = createPerformanceTable(test_data)
+
+#SVM
+test_data$prediction =  ifelse(predict_loan_status_svm<0.5,"Default","Fully Paid")
+svm_table = createPerformanceTable(test_data)
+
+#rf
+test_data$prediction =  ifelse(predict_loan_status_rf<0.5,"Default","Fully Paid")
+rf_table = createPerformanceTable(test_data)
+
+#XGB
+test_data$prediction =  ifelse(predict_loan_status_xgb<0.5,"Default","Fully Paid")
+xgb_table = createPerformanceTable(test_data)
+
+#ensemble
+test_data$prediction =  ifelse(predict_loan_status_ensemble<0.5,"Default","Fully Paid")
+ensemble_table = createPerformanceTable(test_data)
+
+```
+
+For Logistic Regression:
+```{r}
+logit_table
+```
+
+For SVM:
+```{r}
+svm_table
+```
+
+For RandomForest:
+```{r}
+rf_table
+```
+
+For XGB:
+```{r}
+xgb_table
+```
+
+For Ensemble model:
+```{r}
+ensemble_table
+```
+
+Our baseline strategy:
+```{r}
+baseline_table
+```
+
+We can visualize returns for each model:
+
+```{r roi_graph}
+logit_table$model_name = "logit"
+svm_table$model_name = "svm"
+rf_table$model_name = "rf"
+xgb_table$model_name = "xgb"
+ensemble_table$model_name = "ensemble"
+baseline_table$model_name = "baseline"
+
+full_table = rbind(logit_table,svm_table,rf_table,xgb_table,ensemble_table,baseline_table)
+
+ggplot(full_table,aes(x=grade,y=roi*100,group=model_name)) + 
+    geom_line(aes(colour = model_name)) + 
+    geom_point() +
+    xlab("Grade") +
+    ylab("ROI(%)") +
+    labs(title = "Return on identified 2015 loans")
+```
+
+and percentage of loans for each grade they picked:
+
+```{r}
+ggplot(full_table,aes(x=grade,y=percent_pick,group=model_name)) + 
+    geom_line(aes(colour = model_name)) + 
+    geom_point() +
+    xlab("Grade") +
+    ylab("Percent Picked(%)") +
+    labs(title = "Loan picked")
+```
+
+All 5 prediction models beat the benchmark strategy in nearly very aspects. Though they done so for low-grade loans by selecting virtually none. Percentage of loan picked by SVM taper off very fast for D, E, F, G grades. It has high Specificity(ability to recall default) so it might be best to use against riskier loans. Many models do shine on predicting middle rate- B, C, D grade - loans, as their ROI is significantly higher than the baseline's, and still have sizable investment.
+
+# Conclusion
+
+Determining loan outcome, like many financial predictions, is cleary not an easy task. Our models barely go above 20% Kappa Statistics which indicates that chance still play a large role here. They also penalized low grade loans so much that they rather not select anythings, and thus prevent us from reaping benefits of higer interest rate. Our finding nevertheless show a promising venue in loan prediction, as higher-than-average ROI can still be gained on certain loan quality. Futher analysis may incorporate some discarded features, such as `emp_title`, or external information, like relevant economic status, into the model.
+
