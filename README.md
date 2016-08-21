@@ -8,5 +8,3 @@ Report can be found here:
 (1) http://rpubs.com/vitidN/200695
 
 (2) analysis_report.html
-
-(3) Predict LendingClub’s Loan Data.pdf
