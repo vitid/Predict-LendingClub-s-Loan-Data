@@ -6,7 +6,7 @@ output:
 ---
 
 # Synopsis
-In this report, we attempt to predict the risk of the loan being default based on the past loan data. We obtained data from LendingClub's website(<https://www.lendingclub.com/info/download-data.action>). We use loan data from year 2012-2014 as training and cross validation set and loan data from year 2015 as a testing set. We also compare our investment performance against the baseline algorithm. We found that, among multiple machine learning algorithms that we tried, Logistic Regression provided a reasonable trade-off performance, and a higher return than the naive loan picking strategy can be achieved.
+In this report, we attempt to predict the risk of the loan being default based on the past loan data. We obtained data from LendingClub's website(<https://www.lendingclub.com/info/download-data.action>). We use loan data from year 2012-2014 as training and cross-validation set and loan data from year 2015 as a testing set. We also compare our investment performance against the baseline algorithm. We found that, among multiple machine learning algorithms that we tried, Logistic Regression provided a reasonable trade-off performance, and a higher return than the naive loan picking strategy can be achieved.
 
 ```{r setup, include=FALSE}
 #cache the result
@@ -15,9 +15,9 @@ knitr::opts_chunk$set(cache=TRUE)
 
 # Explore Data
 
-The loan dataset can be downloaded from <https://www.lendingclub.com/info/download-data.action>. We renamed the file of 2012-2013 loan data to `loan_2012_2013.csv`, 2014 loan data to `loan_2014.csv` and 2015 loan data to `loan_2015.csv`. We stored them on the same directory of the script. The data dictionary can be found at the same url.  
+The loan dataset can be downloaded from <https://www.lendingclub.com/info/download-data.action>. We renamed the file of 2012-2013 loan data to `loan_2012_2013.csv`, 2014 loan data to `loan_2014.csv` and 2015 loan data to `loan_2015.csv`. We stored them on the same directory of the script. The data dictionary can be found at the same URL.  
   
-There are 7 loan status: `Charged Off`,`Current`,`Default`,`Fully Paid`,`In Grace Period`,`Late (16-30 days)`,`Late (31-120 days)`. We consider `Late (31-120 days)`, `Default`, `Charged Off` as a default loan and `Fully Paid` as a desirable loan and ignore everything else. We can create shell script to filter such loan instead of loading the entire files.  
+There are 7 loan statuses: `Charged Off`,`Current`,`Default`,`Fully Paid`,`In Grace Period`,`Late (16-30 days)`,`Late (31-120 days)`. We consider `Late (31-120 days)`, `Default`, `Charged Off` as a default loan and `Fully Paid` as a desirable loan and ignore everything else. We can create a shell script to filter such loan instead of loading the entire files.  
   
 We create extract.sh to perform the task:  
   
@@ -175,7 +175,7 @@ The `baseline_table` served as a baseline performance when we evaluate our model
 
 # Model Building Strategy
 
-2012-2014 data will served as training & cross validation set and 2015 as a test set. We will put more emphasis on avoiding **default** loans since they can wreak havoc on our overall investment. We also take a note of percentage of loan picked as picking a small number of loans doesn't make a sizable investment.
+2012-2014 data will be served as training & cross validation set and 2015 as a test set. We will put more emphasis on avoiding **default** loans since they can wreak havoc on our overall investment. We also take a note of percentage of loan picked as picking a small number of loans doesn't make a sizable investment.
 
 # Feature Engineering
 
@@ -189,7 +189,7 @@ dim(data1)
 rm(data)
 ```
 
-Looking at the data dictionary, we can identify and drop irrelevant features(features that do not appear at the issued time, or id field). `emp_title` maybe useful but it need to be effectively categorized.
+Looking at the data dictionary, we can identify and drop irrelevant features(features that do not appear at the issued time, or id field). `emp_title` may be useful but it needed to be effectively categorized.
 
 ```{r drop_irrelevant_features}
 discard_column = c("collection_recovery_fee","emp_title",
@@ -333,7 +333,7 @@ We then proceed to drop the zero variance features
 data1 = (data1[,!(names(data1) %in% discard_column)])
 ```
 
-Next, we investigate whether `desc`(description) can be useful in determining Default and Fully Paid loand. However, noted that our test dataset(2015 loans) has only **9** loans with non-empty description's length so `desc` is quite useless for current 2015 data. Also noted that information in `title` is replicated in `purpose` so we will drop them.
+Next, we investigate whether `desc`(description) can be useful in determining Default and Fully Paid loan. However, noted that our test dataset(2015 loans) has only **9** loans with non-empty description's length so `desc` is quite useless for current 2015 data. Also noted that information in `title` is replicated in `purpose` so we will drop them.
 
 ```{r drop_desc_title}
 data1$desc = NULL
@@ -473,7 +473,7 @@ data1$loan_status = ifelse(data1$loan_status == "Fully Paid","Fully.Paid",data1$
 data1$loan_status = factor(data1$loan_status,levels = c("Default","Fully.Paid"))
 ```
 
-The data is centered and scaled. We can try to remove the number of dimension further by fitting Logistic regression and investigate p-value of the coefficients. The null hypothesis is that each feature makes no contribution to the predictive model(its coefficient is zero). We then discard each feature that fails to reject the hypothesis.
+The data is centered and scaled. We can try to remove the number of dimensions further by fitting Logistic regression and investigate p-value of the coefficients. The null hypothesis is that each feature makes no contribution to the predictive model(its coefficient is zero). We then discard each feature that fails to reject the hypothesis.
 
 ```{r center_scale_data}
 trans_model = preProcess(data1,method=c("center","scale"))
@@ -574,21 +574,21 @@ test_data_total_pymnt = test_data$total_pymnt
 test_data = applyFeatureEngineering(test_data)
 ```
 
-The loan data typically have higher proportion of good loans. We can achieve high accuracy just by labelling all loans as `Fully Paid`
+The loan data typically have a higher proportion of good loans. We can achieve high accuracy just by labeling all loans as `Fully Paid`
 
 ```{r}
 100*nrow(test_data %>% filter(loan_status=="Fully.Paid"))/nrow(test_data)
 ```
 
-For our test data, we gain 72.3% accuracy by just following the above strategy. Recall that we yet to include the outcome of `Current` loans. In a real situation, the raito of `Fully Paid` loans is usually much higher so accuracy metric is not our main concern here. We instead focus on a trade-off in identifying a default loan as an expense of mislabelling some good loans. We will look at ROC curve and pay particular focus on AUC when we train our models.  
+For our test data, we gain 72.3% accuracy by just following the above strategy. Recall that we yet to include the outcome of `Current` loans. In a real situation, the ratio of `Fully Paid` loans is usually much higher so accuracy metric is not our main concern here. We instead focus on a trade-off in identifying a default loan as an expense of mislabelling some good loans. We will look at ROC curve and pay particular focus on AUC when we train our models.  
 
-Because there is a disproportion of target variable, we downsampling the Fully Paid loans to be equal to Default loans. This method tends to work well and run faster than upsampling or cost-sensitive training.  
+Because there is a disproportion of the target variable, we downsampling the Fully Paid loans to be equal to Default loans. This method tends to work well and run faster than upsampling or cost-sensitive training.  
 
-Noted that at the end, we aim to stack the results of various learning models(Logistic Regression,SVM,RandomForest, and XGB). Since the downside of downsampling is that information of majority class is discarded, we will continue to make a new downsampling data when we feed it to each model along the way. We anticipate that better result can be obtained by stacking all 4 models since it get more information from the majority class.
+Noted that at the end, we aim to stack the results of various learning models(Logistic Regression,SVM,RandomForest, and XGB). Since the downside of downsampling is that information of majority class is discarded, we will continue to make a new downsampling data when we feed it to each model along the way. We anticipate that better result can be obtained by stacking all 4 models since it gets more information from the majority class.
 
 ## Logistic Regression
 
-We tune Logistic Regression to our training dataset. We use Elastic Net regularization, which comprised of Ridge and Lasso regularization, with cross validation to prevent overfitting. Our goal is maximizing AUC.  
+We tune Logistic Regression to our training dataset. We use Elastic Net regularization, which comprised of Ridge and Lasso regularization, with cross-validation to prevent overfitting. Our goal is maximizing AUC.  
   
 Due to limited computation resource, we run model tunning on small data and fixed lambda parameter. We use small fold: 3-fold cross validation. We then refit the best model with the whole data.  
 (Noted:we put the final tuning result here instead of running through the whole  process. We disable the execution of tuning code although readers can enable it back by setting `eval` = TRUE )
@@ -819,7 +819,7 @@ tail(table_perf,1)
 
 ## Extreme Gradient Boosting
 
-Extreme Gradient Boosting has a very effecient implementation. Unlike SVM and RandomForest, we can tune parameter using the whole downsampling set. We focus on varying Reidge & Lasso regularization and learning rate. We use 10% of data for validating tuning parameter.
+Extreme Gradient Boosting has a very efficient implementation. Unlike SVM and RandomForest, we can tune parameter using the whole downsampling set. We focus on varying Ridge & Lasso regularization and learning rate. We use 10% of data for validating tuning parameter.
 
 ```{r}
 set.seed(400)
@@ -973,9 +973,9 @@ plot(rocCurve_ensemble,legacy.axes = TRUE,col="black",add=TRUE)
 legend("bottomright",legend=c("logit","svm","rf","xbg","ensemble"),fill=c("red","blue","green","orange","black"))
 ```
 
-Kappa statistics from all models exceed 20% by just small amount, which indicate that they perform moderately better than chance. XGB takes advantage of receiving all downsampling data and provides highest AUC. Comparing performance across models may not be valid, though, because we use different downsampling data for each model. Ensemble model doesn't imporove AUC as we expected.
+Kappa statistics from all models exceed 20% by just small amount, which indicated that they perform moderately better than chance. XGB takes advantage of receiving all downsampling data and provides highest AUC. Comparing performance across models may not be valid, though, because we use different downsampling data for each model. Ensemble model doesn't improve AUC as we expected.
 
-We are surprised to find that Logistic regression does provide a very competitive performance. At 50% cutoff, it yields reasonable compromise between percentage of correctly identified good loans(Sensitivity) and bad loans(Specificity) while not sacrificing Accuracy too much(recall that the naive strategy yields 72.3% accuracy). SVM with RBF kernel has lowest AUC. We can train it with only some portion of data as time complexity of the model rapidly jump up. RandomForest yields comparabale result to Logistic Regression. XGB sacrifices Sensitivity rate for Specificity(ability to recall bad loans). It maybe suitable if we really want to avoid default loans. Ensemble model does tune up XGB a little bit. Given the simplicity of Logistic Regression model, and ROC graph are, over all, not significantly difference, we recommend it as a model of choice for predicting LendingClub dataset.
+We are surprised to find that Logistic regression does provide a very competitive performance. At 50% cutoff, it yields reasonable compromise between the percentage of correctly identified good loans(Sensitivity) and bad loans(Specificity) while not sacrificing Accuracy too much(recall that the naive strategy yields 72.3% accuracy). SVM with RBF kernel has lowest AUC. We can train it with only some portion of data as time complexity of the model rapidly jump up. RandomForest yields a comparable result to Logistic Regression. XGB sacrifices Sensitivity rate for Specificity(ability to recall bad loans). It may be suitable if we really want to avoid default loans. Ensemble model does tune up XGB a little bit. Given the simplicity of Logistic Regression model, and ROC graphs are, overall, not significantly difference, we recommend it as a model of choice for predicting LendingClub dataset.
 
 We can calculate investment performance assumed that we follow each model predictions based on 50% cutoff:
 
@@ -1068,9 +1068,9 @@ ggplot(full_table,aes(x=grade,y=percent_pick,group=model_name)) +
     labs(title = "Loan picked")
 ```
 
-All 5 prediction models beat the benchmark strategy in nearly very aspects. Though they done so for low-grade loans by selecting virtually none. Percentage of loan picked by SVM taper off very fast for D, E, F, G grades. It has high Specificity(ability to recall default) so it might be best to use against riskier loans. Many models do shine on predicting middle rate- B, C, D grade - loans, as their ROI is significantly higher than the baseline's, and still have sizable investment.
+All 5 prediction models beat the benchmark strategy in nearly very aspects. Though they did so for low-grade loans by selecting virtually none. Percentage of loan picked by SVM taper off very fast for D, E, F, G grades. It has high Specificity(ability to recall default) so it might be best to use against riskier loans. Many models do shine on predicting middle rate- B, C, D grade - loans, as their ROI is significantly higher than the baseline's, and still have sizable investment.
 
 # Conclusion
 
-Determining  the loan outcome, like many financial predictions, is cleary not an easy task. Our models barely go above 20% Kappa Statistics which indicates that chance still play a large role here. They also penalized low grade loans so much that they rather not select anythings, and thus prevent us from reaping benefits of higer interest rate. Our finding nevertheless show a promising venue in loan prediction, as higher-than-average ROI can still be gained on certain loan quality. Futher analysis may incorporate some discarded features, such as `emp_title`, or external information, like relevant economic status, into the model.
+Determining  the loan outcome, like many financial predictions, is clearly not an easy task. Our models barely go above 20% Kappa Statistics which indicates that chance still played a large role here. They also penalized low-grade loans so much that they rather not select anythings, and thus prevent us from reaping benefits of higher interest rate. Our finding nevertheless shows a promising venue in loan prediction, as higher-than-average ROI can still be gained on certain loan quality. A further analysis may incorporate some discarded features, such as `emp_title`, or external information, like relevant economic status, into the model.
 
